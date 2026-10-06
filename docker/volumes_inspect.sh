@@ -1,294 +1,194 @@
 #!/bin/bash
 
-# Скрипт для анализа дискового пространства Docker
-# Включает анализ логов и volumes
-
-# Цвета для вывода
+# Анализ логов контейнеров и всех Docker volumes. Linux, Bash 4+.
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Функция для вывода справки
 show_help() {
     echo "Использование: $0 [ОПЦИИ]"
-    echo ""
-    echo "Опции:"
-    echo "  -h, --help      Показать эту справку"
-    echo "  -a, --all       Показать все контейнеры (включая остановленные)"
-    echo "  -l, --limit N   Показать топ N контейнеров (по умолчанию: 10)"
+    echo "  -h, --help      Показать справку"
+    echo "  -a, --all       Включить остановленные контейнеры в анализ логов"
+    echo "  -l, --limit N   Топ N контейнеров по размеру логов (по умолчанию: 10)"
     echo "  --logs-only     Только анализ логов"
     echo "  --volumes-only  Только анализ volumes"
-    echo ""
-    echo "Примеры:"
-    echo "  $0                    # Полный анализ (логи + volumes)"
-    echo "  $0 -l 5              # Топ-5 в каждой категории"
-    echo "  $0 --logs-only       # Только анализ логов"
+    echo "Volumes всегда выводятся все, независимо от --all и --limit."
+    echo "ACTIVE: есть работающий контейнер; INACTIVE: только остановленные; UNUSED: нет контейнеров."
+    echo "Размер измеряется на Docker-хосте через du; недоступный размер обозначается N/A."
 }
 
-# Функция для конвертации байтов в человеко-читаемый формат
 human_readable() {
-    local bytes=$1
     if command -v numfmt >/dev/null 2>&1; then
-        numfmt --to=iec --suffix=B $bytes
+        numfmt --to=iec --suffix=B "$1"
     else
-        if [ $bytes -ge 1073741824 ]; then
-            echo "$(echo "scale=2; $bytes/1073741824" | bc)GB"
-        elif [ $bytes -ge 1048576 ]; then
-            echo "$(echo "scale=2; $bytes/1048576" | bc)MB"
-        elif [ $bytes -ge 1024 ]; then
-            echo "$(echo "scale=2; $bytes/1024" | bc)KB"
-        else
-            echo "${bytes}B"
-        fi
+        awk -v b="$1" 'BEGIN {
+            split("B KiB MiB GiB TiB PiB EiB", u, " ");
+            i=1; while (b>=1024 && i<7) { b/=1024; i++ }
+            printf "%.2f%s\n", b, u[i]
+        }'
     fi
 }
 
-# Функция для получения пути к логам
-get_log_path() {
-    local container=$1
-    docker inspect --format='{{.LogPath}}' "$container" 2>/dev/null
-}
-
-# Функция для анализа логов контейнера
 analyze_container_logs() {
-    local container=$1
-    
+    local container=$1 info name image driver log_path size=0 entries=0
     echo "Анализ контейнера: $container" >&2
-    
-    # Получаем базовую информацию
-    local name=$(docker inspect --format='{{.Name}}' "$container" 2>/dev/null | sed 's|/||')
-    local image=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null)
-    local status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null)
-    
-    # Получаем путь к логам
-    local log_path=$(get_log_path "$container")
-    
-    local log_size=0
-    local log_entries=0
-    local log_driver="unknown"
-    
-    if [ -n "$log_path" ] && [ "$log_path" != "null" ] && [ "$log_path" != "<no value>" ]; then
-        if [ -f "$log_path" ]; then
-            # Получаем размер лога
-            log_size=$(stat -c%s "$log_path" 2>/dev/null || echo "0")
-            # Получаем количество записей
-            log_entries=$(wc -l < "$log_path" 2>/dev/null || echo "0")
-            # Получаем драйвер логирования
-            log_driver=$(docker inspect --format='{{.HostConfig.LogConfig.Type}}' "$container" 2>/dev/null || echo "json-file")
-        fi
+    info=$(docker inspect --format '{{printf "%s\t%s\t%s\t%s" .Name .Config.Image .HostConfig.LogConfig.Type .LogPath}}' "$container") || return 1
+    IFS=$'\t' read -r name image driver log_path <<< "$info"
+    name=${name#/}
+    log_path=${log_path:--}
+    driver=${driver:-unknown}
+    if [[ -f "$log_path" && -r "$log_path" ]]; then
+        size=$(stat -c%s -- "$log_path" 2>/dev/null) || size=0
+        entries=$(wc -l < "$log_path" 2>/dev/null) || entries=0
+        entries=${entries//[[:space:]]/}
     fi
-    
-    # Выводим результат в формате для сортировки
-    echo "$log_size $log_driver $log_entries $log_path $name $image $status $container"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$size" "$name" "$image" "$entries" "$driver" "$log_path"
 }
 
-# Функция для анализа volumes
-analyze_docker_volumes() {
-    echo "Анализ volumes..." >&2
-    local volumes_file=$(mktemp)
-    
-    docker volume ls -q 2>/dev/null | while read volume; do
-        local volume_info=$(docker volume inspect "$volume" 2>/dev/null)
-        if [ -n "$volume_info" ]; then
-            local mountpoint=$(echo "$volume_info" | grep -o '"Mountpoint":"[^"]*"' | cut -d'"' -f4)
-            if [ -n "$mountpoint" ] && [ -d "$mountpoint" ]; then
-                local size=$(du -sb "$mountpoint" 2>/dev/null | cut -f1)
-                local driver=$(echo "$volume_info" | grep -o '"Driver":"[^"]*"' | cut -d'"' -f4)
-                echo "$size $volume $driver $mountpoint"
+report_container_logs() (
+    local show_all=$1 limit=$2 ids id rows size name image entries driver log_path
+    rows=$(mktemp) || return 1
+    trap 'rm -f -- "$rows"' EXIT
+    if [[ "$show_all" == true ]]; then
+        ids=$(docker ps -aq) || return 1
+    else
+        ids=$(docker ps -q) || return 1
+    fi
+    if [[ -z "$ids" ]]; then
+        echo "Контейнеры не найдены"
+        return 0
+    fi
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        analyze_container_logs "$id" >> "$rows" || return 1
+    done <<< "$ids"
+    printf '%-30s %-30s %-12s %-12s %s\n' "CONTAINER" "IMAGE" "LOG SIZE" "ENTRIES" "DRIVER"
+    while IFS=$'\t' read -r size name image entries driver log_path; do
+        printf '%-30s %-30s %-12s %-12s %s\n' "$name" "$image" "$(human_readable "$size")" "$entries" "$driver"
+    done < <(sort -t $'\t' -k1,1nr "$rows" | head -n "$limit")
+    echo
+    echo -e "${CYAN}ПУТИ К ЛОГАМ (топ 5):${NC}"
+    while IFS=$'\t' read -r size name image entries driver log_path; do
+        [[ "$log_path" == '-' ]] || printf '%s: %s\n' "$name" "$log_path"
+    done < <(sort -t $'\t' -k1,1nr "$rows" | head -n 5)
+)
+
+analyze_docker_volumes() (
+    local volumes ids id data volume name running info driver mountpoint usage size status rows human
+    local total=0 unknown=0 active=0 inactive=0 unused=0
+    declare -A containers=() running_volumes=()
+    volumes=$(docker volume ls -q) || return 1
+    if [[ -z "$volumes" ]]; then
+        echo "Volumes не найдены"
+        return 0
+    fi
+    ids=$(docker ps -aq) || return 1
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        data=$(docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{printf "%s\t%s\t%t\n" .Name $.Name $.State.Running}}{{end}}{{end}}' "$id") || {
+            echo "Ошибка проверки контейнера $id. Повторите анализ." >&2
+            return 1
+        }
+        while IFS=$'\t' read -r volume name running; do
+            [[ -n "$volume" ]] || continue
+            name=${name#/}
+            containers["$volume"]="${containers[$volume]:+${containers[$volume]}, }$name"
+            [[ "$running" != true ]] || running_volumes["$volume"]=1
+        done <<< "$data"
+    done <<< "$ids"
+    rows=$(mktemp) || return 1
+    trap 'rm -f -- "$rows"' EXIT
+    echo "Анализ всех volumes (измерение размера может занять время)..." >&2
+    while IFS= read -r volume; do
+        [[ -n "$volume" ]] || continue
+        if [[ ${running_volumes[$volume]:-0} == 1 ]]; then
+            status=ACTIVE
+            active=$((active + 1))
+        elif [[ -n ${containers[$volume]:-} ]]; then
+            status=INACTIVE
+            inactive=$((inactive + 1))
+        else
+            status=UNUSED
+            unused=$((unused + 1))
+        fi
+        driver='-'
+        mountpoint='-'
+        size=-1
+        if info=$(docker volume inspect --format '{{printf "%s\t%s" .Driver .Mountpoint}}' "$volume"); then
+            IFS=$'\t' read -r driver mountpoint <<< "$info"
+            if [[ -n "$mountpoint" && -d "$mountpoint" ]] && usage=$(du -s -B1 -- "$mountpoint" 2>/dev/null); then
+                size=${usage%%$'\t'*}
+                [[ "$size" =~ ^[0-9]+$ ]] || size=-1
             fi
         fi
-    done > "$volumes_file"
-    
-    echo "$volumes_file"
-}
+        if (( size >= 0 )); then
+            total=$((total + size))
+        else
+            unknown=$((unknown + 1))
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$size" "$volume" "$status" "${driver:--}" "${containers[$volume]:--}" "${mountpoint:--}" >> "$rows"
+    done <<< "$volumes"
+    printf '%-40s %-10s %-12s %-12s %s\n' "VOLUME" "STATUS" "DISK SIZE" "DRIVER" "CONTAINERS"
+    while IFS=$'\t' read -r size volume status driver name mountpoint; do
+        human=N/A
+        if (( size >= 0 )); then human=$(human_readable "$size"); fi
+        printf '%-40s %-10s %-12s %-12s %s\n' "$volume" "$status" "$human" "$driver" "$name"
+    done < <(sort -t $'\t' -k1,1nr "$rows")
+    printf '\nACTIVE: %s | INACTIVE: %s | UNUSED: %s\n' "$active" "$inactive" "$unused"
+    printf 'Суммарный измеренный размер: %s\n' "$(human_readable "$total")
+"
+    if (( unknown > 0 )); then
+        printf 'Размер недоступен для %s volumes; они не включены в сумму.\n' "$unknown"
+    fi
+    echo
+    echo -e "${CYAN}ПУТИ К VOLUMES (все):${NC}"
+    while IFS=$'\t' read -r size volume status driver name mountpoint; do
+        printf '%s: %s\n' "$volume" "$mountpoint"
+    done < <(sort -t $'\t' -k1,1nr "$rows")
+)
 
-# Основная функция
 main() {
-    # Парсинг аргументов
-    local SHOW_ALL=false
-    local LIMIT=10
-    local LOGS_ONLY=false
-    local VOLUMES_ONLY=false
-    
-    while [[ $# -gt 0 ]]; do
+    local show_all=false limit=10 logs_only=false volumes_only=false
+    while (( $# )); do
         case $1 in
-            -h|--help)
-                show_help
-                exit 0
-                ;;
-            -a|--all)
-                SHOW_ALL=true
-                shift
-                ;;
+            -h|--help) show_help; return 0 ;;
+            -a|--all) show_all=true; shift ;;
             -l|--limit)
-                LIMIT="$2"
-                shift 2
-                ;;
-            --logs-only)
-                LOGS_ONLY=true
-                shift
-                ;;
-            --volumes-only)
-                VOLUMES_ONLY=true
-                shift
-                ;;
-            *)
-                echo "Неизвестный параметр: $1"
-                show_help
-                exit 1
-                ;;
+                if [[ $# -lt 2 || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "Ошибка: --limit требует положительное целое число" >&2
+                    return 1
+                fi
+                limit=$2; shift 2 ;;
+            --logs-only) logs_only=true; shift ;;
+            --volumes-only) volumes_only=true; shift ;;
+            *) echo "Неизвестный параметр: $1" >&2; show_help; return 1 ;;
         esac
     done
-
-    # Проверка Docker
-    if ! command -v docker &> /dev/null; then
-        echo -e "${RED}Ошибка: docker не установлен${NC}"
-        exit 1
+    if (( BASH_VERSINFO[0] < 4 )); then
+        echo "Ошибка: требуется Bash 4 или новее" >&2; return 1
     fi
-
-    if ! docker info >/dev/null 2>&1; then
-        echo -e "${RED}Ошибка: Docker daemon не доступен${NC}"
-        exit 1
+    if [[ "$logs_only" == true && "$volumes_only" == true ]]; then
+        echo "Ошибка: --logs-only и --volumes-only несовместимы" >&2; return 1
     fi
-
+    command -v docker >/dev/null 2>&1 || { echo "Ошибка: docker не установлен" >&2; return 1; }
+    docker info >/dev/null 2>&1 || { echo "Ошибка: Docker daemon недоступен" >&2; return 1; }
     echo -e "${BLUE}Анализ дискового пространства Docker...${NC}"
-    echo ""
-
-    # Анализ контейнеров
-    if [ "$VOLUMES_ONLY" = false ]; then
+    if [[ "$volumes_only" == false ]]; then
         echo -e "${PURPLE}ТАБЛИЦА 1: Логи контейнеров${NC}"
-        echo "=================================================================================================="
-        
-        # Получаем список контейнеров
-        if [ "$SHOW_ALL" = true ]; then
-            CONTAINERS=$(docker ps -aq)
-        else
-            CONTAINERS=$(docker ps -q)
-        fi
-        
-        if [ -z "$CONTAINERS" ]; then
-            echo "Контейнеры не найдены"
-        else
-            # Создаем временный файл для результатов
-            local temp_file=$(mktemp)
-            
-            # Анализируем каждый контейнер
-            for container in $CONTAINERS; do
-                analyze_container_logs "$container" >> "$temp_file"
-            done
-            
-            # Выводим таблицу логов
-            echo "ИМЯ КОНТЕЙНЕРА          ОБРАЗ               РАЗМЕР ЛОГОВ   ЗАПИСИ   ДРАЙВЕР"
-            echo "--------------------------------------------------------------------------------------------------"
-            
-            sort -nr "$temp_file" | head -n "$LIMIT" | while read line; do
-                local log_size=$(echo "$line" | awk '{print $1}')
-                local log_driver=$(echo "$line" | awk '{print $2}')
-                local log_entries=$(echo "$line" | awk '{print $3}')
-                local log_path=$(echo "$line" | awk '{print $4}')
-                local name=$(echo "$line" | awk '{print $5}')
-                local image=$(echo "$line" | awk '{print $6}')
-                local status=$(echo "$line" | awk '{print $7}')
-                local container_id=$(echo "$line" | awk '{print $8}')
-                
-                local human_size=$(human_readable $log_size)
-                
-                printf "%-20s %-20s %-12s %-8s %-10s\n" \
-                    "${name:0:19}" \
-                    "${image:0:19}" \
-                    "$human_size" \
-                    "$log_entries" \
-                    "${log_driver:0:9}"
-            done
-            
-            echo "=================================================================================================="
-            
-            # Таблица путей к логам (топ 5)
-            echo ""
-            echo -e "${CYAN}ПУТИ К ЛОГАМ (топ 5):${NC}"
-            echo "=================================================="
-            
-            sort -nr "$temp_file" | head -n 5 | while read line; do
-                local name=$(echo "$line" | awk '{print $5}')
-                local log_path=$(echo "$line" | awk '{print $4}')
-                
-                if [ "$log_path" != "unknown" ] && [ -n "$log_path" ]; then
-                    echo "Контейнер: $name"
-                    echo "Путь: $log_path"
-                    echo "--------------------------------------------------"
-                fi
-            done
-            
-            # Очистка
-            rm -f "$temp_file"
-        fi
-        
-        echo ""
+        report_container_logs "$show_all" "$limit" || return 1
+        echo
     fi
-
-    # Анализ volumes
-    if [ "$LOGS_ONLY" = false ]; then
+    if [[ "$logs_only" == false ]]; then
         echo -e "${BLUE}ТАБЛИЦА 2: Docker Volumes${NC}"
-        echo "=================================================================================="
-        
-        local volumes_file=$(analyze_docker_volumes)
-        
-        if [ -s "$volumes_file" ]; then
-            echo "VOLUME               РАЗМЕР         ДРАЙВЕР"
-            echo "----------------------------------------------------------------------------------"
-            
-            sort -nr "$volumes_file" | head -n "$LIMIT" | while read line; do
-                local size=$(echo "$line" | awk '{print $1}')
-                local volume=$(echo "$line" | awk '{print $2}')
-                local driver=$(echo "$line" | awk '{print $3}')
-                local mountpoint=$(echo "$line" | awk '{print $4}')
-                
-                local human_size=$(human_readable $size)
-                
-                printf "%-20s %-12s %-10s\n" \
-                    "${volume:0:19}" \
-                    "$human_size" \
-                    "${driver:0:9}"
-            done
-            
-            echo "=================================================================================="
-            
-            # Пути к volumes
-            echo ""
-            echo -e "${CYAN}ПУТИ К VOLUMES (топ 5):${NC}"
-            echo "=================================================="
-            
-            sort -nr "$volumes_file" | head -n 5 | while read line; do
-                local volume=$(echo "$line" | awk '{print $2}')
-                local mountpoint=$(echo "$line" | awk '{print $4}')
-                
-                echo "Volume: $volume"
-                echo "Путь: $mountpoint"
-                echo "--------------------------------------------------"
-            done
-        else
-            echo "Volumes не найдены"
-        fi
-        
-        # Очистка
-        if [ -f "$volumes_file" ]; then
-            rm -f "$volumes_file"
-        fi
-        
-        echo ""
+        analyze_docker_volumes || return 1
+        echo
     fi
-
-    # Общая статистика
     echo -e "${GREEN}ОБЩАЯ СТАТИСТИКА DOCKER:${NC}"
-    docker system df
-    echo ""
-    
+    docker system df || return 1
     echo -e "${GREEN}АНАЛИЗ ЗАВЕРШЕН${NC}"
 }
 
-# Запуск главной функции
 main "$@"
